@@ -6,14 +6,33 @@ Setup:
   1. pip install python-telegram-bot firebase-admin
   2. Create a Firebase project -> Firestore Database -> generate a service
      account key (Project Settings > Service Accounts > Generate new private
-     key) and save it as serviceAccountKey.json next to this file (or set
-     FIREBASE_CRED_PATH to point to it).
+     key).
   3. Set environment variables before running:
-       BOT_TOKEN            - your Telegram bot token from @BotFather
-       FIREBASE_CRED_PATH    - path to serviceAccountKey.json (optional,
-                                defaults to "serviceAccountKey.json")
+       BOT_TOKEN                - your Telegram bot token from @BotFather
+       FIREBASE_CREDENTIALS_JSON - the ENTIRE contents of serviceAccountKey.json,
+                                    pasted as one env var value (or its base64
+                                    encoding — recommended on hosts like Railway,
+                                    since their UI can mangle the multi-line
+                                    private key in raw JSON). This is the
+                                    preferred way to run on Railway/Heroku/etc.,
+                                    since those platforms don't give you a
+                                    persistent place to keep a credentials file.
+       FIREBASE_CRED_PATH        - (optional) path to a serviceAccountKey.json
+                                    file on disk. Only used as a fallback if
+                                    FIREBASE_CREDENTIALS_JSON is not set — handy
+                                    for local development. Defaults to
+                                    "serviceAccountKey.json".
   4. Edit ADMIN_IDS and REQUIRED_CHANNELS below.
   5. Run: python coupon_bot.py
+
+  --- Railway deployment note ---
+  In your Railway service, open Variables and add FIREBASE_CREDENTIALS_JSON.
+  Easiest/safest way to set it:
+    base64 -i serviceAccountKey.json | pbcopy   # macOS, copies to clipboard
+    base64 -w0 serviceAccountKey.json           # Linux, prints to stdout
+  then paste that single-line base64 string as the variable's value. The bot
+  detects and decodes base64 automatically; pasting the raw JSON also works,
+  as long as newlines inside the private key survive the paste.
 
 Firestore layout:
   users/{user_id}:
@@ -26,6 +45,8 @@ Firestore layout:
 
 import os
 import time
+import json
+import base64
 import html
 import logging
 import asyncio
@@ -81,8 +102,41 @@ DEFAULT_SLOT_KEYS = ["slot_1", "slot_2"]
 DEFAULT_SLOT_LABELS = {"slot_1": "Slot 1", "slot_2": "Slot 2"}
 
 # ==================== FIREBASE INIT ====================
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
 FIREBASE_CRED_PATH = os.environ.get("FIREBASE_CRED_PATH", "serviceAccountKey.json")
-cred = credentials.Certificate(FIREBASE_CRED_PATH)
+
+
+def _load_firebase_credentials() -> credentials.Certificate:
+    """Load Firebase creds from an env var (preferred, e.g. on Railway) or a file (local dev)."""
+    if FIREBASE_CREDENTIALS_JSON:
+        raw = FIREBASE_CREDENTIALS_JSON.strip()
+        try:
+            cred_dict = json.loads(raw)
+        except json.JSONDecodeError:
+            # Not raw JSON — try treating it as base64-encoded JSON instead.
+            try:
+                decoded = base64.b64decode(raw).decode("utf-8")
+                cred_dict = json.loads(decoded)
+            except Exception as exc:
+                raise SystemExit(
+                    "FIREBASE_CREDENTIALS_JSON is set but is neither valid JSON nor "
+                    "valid base64-encoded JSON. Re-copy the service account key "
+                    "(or its base64 encoding) into that env var."
+                ) from exc
+        return credentials.Certificate(cred_dict)
+
+    if os.path.exists(FIREBASE_CRED_PATH):
+        return credentials.Certificate(FIREBASE_CRED_PATH)
+
+    raise SystemExit(
+        "No Firebase credentials found. Set the FIREBASE_CREDENTIALS_JSON env var "
+        "(the service account JSON, or its base64 encoding — see the setup notes "
+        "at the top of this file) or provide FIREBASE_CRED_PATH pointing to a "
+        "serviceAccountKey.json file on disk."
+    )
+
+
+cred = _load_firebase_credentials()
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -266,17 +320,6 @@ async def add_referrals_to_user(user_id: int, amount: int) -> bool:
             return False
         ref.update({"total_referrals": firestore.Increment(amount)})
         return True
-
-    return await run_sync(_run)
-
-
-async def add_referrals_to_all(amount: int) -> int:
-    def _run():
-        count = 0
-        for doc in USERS.stream():
-            doc.reference.update({"total_referrals": firestore.Increment(amount)})
-            count += 1
-        return count
 
     return await run_sync(_run)
 
@@ -577,6 +620,9 @@ async def on_channel_membership_change(update: Update, context: ContextTypes.DEF
         return 
 
     user_id = cmu.new_chat_member.user.id
+    if user_id == context.bot.id:
+        return
+
     new_status = cmu.new_chat_member.status
     old_status = cmu.old_chat_member.status if cmu.old_chat_member else None
 
@@ -617,8 +663,6 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("➖ Remove Refer", callback_data="admin_removerefer")],
         [InlineKeyboardButton("🏷 Coupon Name", callback_data="admin_couponname")],
         [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
-         InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
-        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
          InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
          InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
@@ -681,14 +725,15 @@ async def _build_welcome_text(display_name: str) -> str:
         lines.append(f"  • {html.escape(name)} — {required} referrals")
     slots_block = "\n".join(lines) if lines else "  • (rewards coming soon)"
 
+    safe_coupon_name = html.escape(coupon_name)
     return (
         f"✨ <b>Welcome, {html.escape(display_name)}!</b>\n\n"
-        f"This bot gives away free <b>{coupon_name}</b> codes to people who invite friends. "
+        f"This bot gives away free <b>{safe_coupon_name}</b> codes to people who invite friends. "
         "Here's how it works:\n\n"
         "🔗 <b>Invite & Earn</b> — Get your personal referral link and share it anywhere. "
         "Every friend who joins and verifies adds 1 to your referral count.\n\n"
         f"🎁 <b>Claim Reward</b> — Once you hit a slot's required referrals, redeem it for a free "
-        f"{coupon_name}:\n{slots_block}\n\n"
+        f"{safe_coupon_name}:\n{slots_block}\n\n"
         "👤 <b>Profile</b> — See your referral count, leaderboard rank, and what you've claimed.\n\n"
         "📜 <b>History</b> — See every code you've redeemed and when.\n\n"
         "⚠️ Each reward slot can only be claimed once per person, and stock is limited — the earlier "
@@ -838,10 +883,13 @@ async def _claim_menu_content(user_id: int, user_data: dict | None = None):
         label = f"🎁 {name} — {refs}/{required} refers | {stock_left} left"
         rows.append([InlineKeyboardButton(label, callback_data=f"claim:{key}")])
 
-    if not rows:
-        text = f"🎉 You've already claimed every available {coupon_name}!"
+    safe_coupon_name = html.escape(coupon_name)
+    if not slots:
+        text = f"⚠️ No {safe_coupon_name} reward slots are configured yet — check back soon."
+    elif not rows:
+        text = f"🎉 You've already claimed every available {safe_coupon_name}!"
     else:
-        text = f"🎁 <b>CLAIM {coupon_name.upper()}</b>\n\nYour referrals: <b>{refs}</b>\nPick a slot to redeem:"
+        text = f"🎁 <b>CLAIM {safe_coupon_name.upper()}</b>\n\nYour referrals: <b>{refs}</b>\nPick a slot to redeem:"
 
     rows.append(
         [InlineKeyboardButton("🔄 Refresh", callback_data="claim_refresh"),
@@ -902,7 +950,7 @@ async def claim_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     else:
         await query.answer("✅ Reward claimed!")
-        coupon_name = await get_coupon_name()
+        coupon_name = html.escape(await get_coupon_name())
         await log_history(user.id, slot_key, result)
         await context.bot.send_message(
             chat_id=user.id,
@@ -982,7 +1030,7 @@ async def inv_additem_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     slot_key = query.data.split(":", 1)[1]
     await query.answer()
-    coupon_name = await get_coupon_name()
+    coupon_name = html.escape(await get_coupon_name())
     slot = await get_slot(slot_key)
     await query.message.edit_text(
         f"➕ Add {coupon_name} to <b>{html.escape(slot.get('name', slot_key))}</b> — single code or bulk paste?",
@@ -1190,7 +1238,7 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     slot_names = dict(all_slots)
     if not entries:
-        msg = f"📜 <b>YOUR HISTORY</b>\n\n<i>No {coupon_name} claims yet.</i>"
+        msg = f"📜 <b>YOUR HISTORY</b>\n\n<i>No {html.escape(coupon_name)} claims yet.</i>"
     else:
         msg = f"📜 <b>YOUR HISTORY</b>\n\n"
         for e in entries:
@@ -1262,7 +1310,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await _get_user_or_banned(user.id, update.message.reply_text)
     if data is None:
         return
-    coupon_name = await get_coupon_name()
+    coupon_name = html.escape(await get_coupon_name())
     msg = (
         "❓ <b>HELP & FAQ</b>\n\n"
         "<b>My referral count didn't go up — why?</b>\n"
