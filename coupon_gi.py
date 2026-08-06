@@ -420,7 +420,8 @@ async def redeem_slot(user_id: int, slot_key: str):
         item = stock[0]
         transaction.update(slot_ref, {"stock": stock[1:]})
         claims[slot_key] = True
-        transaction.update(user_ref, {"claims": claims})
+        new_total = max(0, user_data.get("total_referrals", 0) - required)
+        transaction.update(user_ref, {"claims": claims, "total_referrals": new_total})
         return item
 
     def _run():
