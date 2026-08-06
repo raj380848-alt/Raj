@@ -94,10 +94,11 @@ REQUIRED_CHANNELS = [
     {"name": "LOOT FACTORY", "username": "@LootFactoryX0", "link": "https://t.me/LootFactoryX0"},
     {"name": "SHEIN UPDATE", "username": "@rajuking54", "link": "https://t.me/rajuking54"},
     {"name": "TITAN LOOT", "username": "@titan_loot", "link": "https://t.me/titan_loot"},
-    {"name": "LOOT JUNCTION GC", "username": "@lootjunctiongc", "link": "https://t.me/lootjunctiongc"},
+    {"name": "LOOT JUNCTION", "username": "@loot_junctioon", "link": "https://t.me/loot_junctioon"},
+    {"name": "TITAN GC", "username": "@holytitangc", "link": "https://t.me/holytitangc"}
 ]
 
-SUPPORT_URL = "https://t.me/YourSupportUsername"  # edit this to your real support contact/channel
+SUPPORT_URL = "https://t.me/holytitangc"  # edit this to your real support contact/channel
 
 DEFAULT_SLOT_KEYS = ["slot_1", "slot_2"]
 DEFAULT_SLOT_LABELS = {"slot_1": "Slot 1", "slot_2": "Slot 2"}
@@ -434,24 +435,26 @@ async def redeem_slot(user_id: int, slot_key: str):
 
 async def get_users_summary() -> tuple[int, int]:
     def _get():
-        agg_query = firestore_aggregation.AggregationQuery(USERS)
-        agg_query.count(alias="total")
+        # sum() aggregation queries are unsupported (or misbehave) on some
+        # Firestore client versions/plans and were the actual cause of the
+        # previous "Couldn't load stats" failure. Avoid it entirely: use
+        # count() aggregation (widely supported) for the total, with a plain
+        # document-count fallback if even that fails, and always compute the
+        # referral total by streaming — slower for huge collections, but
+        # reliable everywhere.
         try:
-            agg_query.sum("total_referrals", alias="refs")
+            agg_query = firestore_aggregation.AggregationQuery(USERS)
+            agg_query.count(alias="total")
             results = agg_query.get()
-            values = {r.alias: r.value for group in results for r in group}
-            return int(values.get("total", 0) or 0), int(values.get("refs", 0) or 0)
-        except AttributeError:
-            # Installed google-cloud-firestore version predates sum() aggregation
-            # support. Fall back to a count-only aggregation plus a manual sum.
-            logger.warning("Firestore sum() aggregation unavailable; falling back to manual sum")
-            count_query = firestore_aggregation.AggregationQuery(USERS)
-            count_query.count(alias="total")
-            results = count_query.get()
             values = {r.alias: r.value for group in results for r in group}
             total = int(values.get("total", 0) or 0)
             refs = sum((doc.to_dict() or {}).get("total_referrals", 0) for doc in USERS.stream())
-            return total, refs
+        except Exception:
+            logger.warning("Count aggregation failed; falling back to manual count", exc_info=True)
+            docs = list(USERS.stream())
+            total = len(docs)
+            refs = sum((doc.to_dict() or {}).get("total_referrals", 0) for doc in docs)
+        return total, refs
 
     return await run_sync(_get)
 
@@ -756,6 +759,31 @@ def remove_refer_mode_keyboard() -> InlineKeyboardMarkup:
 
 
 # ==================== START / VERIFICATION ====================
+# ==================== TEXT STYLING ====================
+# Telegram's bot API has no font-size or text-align control — <b>/<i>/<code>
+# are the only styling it supports. To get a visually bigger, distinct-looking
+# "font" for the coupon-name header, map plain letters/digits to the Unicode
+# Mathematical Sans-Serif Bold block, which most Telegram clients render as
+# large bold glyphs. Punctuation/spaces are left untouched.
+_BOLD_SANS_UPPER_BASE = 0x1D5D4  # 𝗔
+_BOLD_SANS_LOWER_BASE = 0x1D5EE  # 𝗮
+_BOLD_SANS_DIGIT_BASE = 0x1D7EC  # 𝟬
+
+
+def _to_bold_sans(text: str) -> str:
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(_BOLD_SANS_UPPER_BASE + (ord(ch) - ord("A"))))
+        elif "a" <= ch <= "z":
+            out.append(chr(_BOLD_SANS_LOWER_BASE + (ord(ch) - ord("a"))))
+        elif "0" <= ch <= "9":
+            out.append(chr(_BOLD_SANS_DIGIT_BASE + (ord(ch) - ord("0"))))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 async def _build_welcome_text(display_name: str) -> str:
     coupon_name = await get_coupon_name()
     slots = await get_all_slots_full()
@@ -767,11 +795,10 @@ async def _build_welcome_text(display_name: str) -> str:
     slots_block = "\n".join(lines) if lines else "  • (rewards coming soon)"
 
     safe_coupon_name = html.escape(coupon_name)
-    header = (
-        "┏━━━━━━━━━━━━━━━┓\n"
-        f"┃   <b>{safe_coupon_name.upper()}</b>   ┃\n"
-        "┗━━━━━━━━━━━━━━━┛\n\n"
-    )
+    # Style FIRST (only touches letters/digits, leaves &, <, > alone), THEN
+    # escape — doing it in the other order would corrupt the stylized text.
+    styled_name = html.escape(_to_bold_sans(coupon_name.upper()))
+    header = f"✨ {styled_name} ✨\n\n"
     return (
         f"✨ <b>Welcome, {html.escape(display_name)}!</b>\n\n"
         f"{header}"
