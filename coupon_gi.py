@@ -430,7 +430,13 @@ async def get_users_summary() -> tuple[int, int]:
 
 async def get_all_user_ids() -> list[int]:
     def _get():
-        return [int(doc.id) for doc in USERS.stream()]
+        ids = []
+        for doc in USERS.stream():
+            try:
+                ids.append(int(doc.id))
+            except ValueError:
+                logger.warning("Skipping user doc with non-numeric ID: %s", doc.id)
+        return ids
 
     return await run_sync(_get)
 
@@ -511,7 +517,14 @@ async def add_new_slot(name: str) -> str:
     def _run():
         data = _get_config_cached(force=True)
         keys = list(data.get("slot_keys", list(DEFAULT_SLOT_KEYS)))
-        n = len(keys) + 1
+        # Start counting from the highest existing slot number (not len(keys)+1),
+        # so a gap left by a removed slot can never collide with an existing key.
+        existing_nums = []
+        for k in keys:
+            suffix = k.rsplit("_", 1)[-1]
+            if suffix.isdigit():
+                existing_nums.append(int(suffix))
+        n = max(existing_nums, default=0) + 1
         new_key = f"slot_{n}"
         while new_key in keys:
             n += 1
@@ -1290,6 +1303,14 @@ async def _send_broadcast_one(context, uid: int, text: str, sem: asyncio.Semapho
             await asyncio.sleep(1.0 / 28)
 
 
+async def cancel_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("pending_action"):
+        context.user_data["pending_action"] = None
+        await update.message.reply_text("❌ Cancelled.")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -1348,6 +1369,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending = context.user_data.get("pending_action")
     if pending and user.id in ADMIN_IDS:
+        if text.strip().lower() == "cancel":
+            context.user_data["pending_action"] = None
+            await update.message.reply_text("❌ Cancelled.")
+            return
         await handle_pending_admin_input(update, context, pending, text)
         context.user_data["pending_action"] = None
         return
@@ -1550,6 +1575,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("cancel", cancel_pending))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(ChatMemberHandler(on_channel_membership_change, ChatMemberHandler.CHAT_MEMBER))
