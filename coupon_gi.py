@@ -64,6 +64,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from telegram.error import RetryAfter, Forbidden, BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -208,6 +209,21 @@ def _invalidate_slot_cache(key: str | None = None):
 # ==================== ASYNC FIRESTORE HELPERS ====================
 async def run_sync(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# ==================== PER-USER ACTION LOCK ====================
+# Prevents a user's rapid double-tap (e.g. mashing "Claim" or "Verify") from
+# firing two overlapping requests — instead the second tap gets an instant
+# "still processing" response instead of queuing behind the first one.
+_user_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
 
 
 async def get_user(user_id: int) -> dict | None:
@@ -420,10 +436,22 @@ async def get_users_summary() -> tuple[int, int]:
     def _get():
         agg_query = firestore_aggregation.AggregationQuery(USERS)
         agg_query.count(alias="total")
-        agg_query.sum("total_referrals", alias="refs")
-        results = agg_query.get()
-        values = {r.alias: r.value for group in results for r in group}
-        return int(values.get("total", 0) or 0), int(values.get("refs", 0) or 0)
+        try:
+            agg_query.sum("total_referrals", alias="refs")
+            results = agg_query.get()
+            values = {r.alias: r.value for group in results for r in group}
+            return int(values.get("total", 0) or 0), int(values.get("refs", 0) or 0)
+        except AttributeError:
+            # Installed google-cloud-firestore version predates sum() aggregation
+            # support. Fall back to a count-only aggregation plus a manual sum.
+            logger.warning("Firestore sum() aggregation unavailable; falling back to manual sum")
+            count_query = firestore_aggregation.AggregationQuery(USERS)
+            count_query.count(alias="total")
+            results = count_query.get()
+            values = {r.alias: r.value for group in results for r in group}
+            total = int(values.get("total", 0) or 0)
+            refs = sum((doc.to_dict() or {}).get("total_referrals", 0) for doc in USERS.stream())
+            return total, refs
 
     return await run_sync(_get)
 
@@ -739,16 +767,20 @@ async def _build_welcome_text(display_name: str) -> str:
     slots_block = "\n".join(lines) if lines else "  • (rewards coming soon)"
 
     safe_coupon_name = html.escape(coupon_name)
+    header = (
+        "┏━━━━━━━━━━━━━━━┓\n"
+        f"┃   <b>{safe_coupon_name.upper()}</b>   ┃\n"
+        "┗━━━━━━━━━━━━━━━┛\n\n"
+    )
     return (
         f"✨ <b>Welcome, {html.escape(display_name)}!</b>\n\n"
+        f"{header}"
         f"This bot gives away free <b>{safe_coupon_name}</b> codes to people who invite friends. "
         "Here's how it works:\n\n"
         "🔗 <b>Invite & Earn</b> — Get your personal referral link and share it anywhere. "
         "Every friend who joins and verifies adds 1 to your referral count.\n\n"
         f"🎁 <b>Claim Reward</b> — Once you hit a slot's required referrals, redeem it for a free "
         f"{safe_coupon_name}:\n{slots_block}\n\n"
-        "👤 <b>Profile</b> — See your referral count, leaderboard rank, and what you've claimed.\n\n"
-        "📜 <b>History</b> — See every code you've redeemed and when.\n\n"
         "⚠️ Each reward slot can only be claimed once per person, and stock is limited — the earlier "
         "you invite, the better your chances of getting a code before a slot runs out.\n\n"
         "Tap a button below to get started. 👇"
@@ -762,6 +794,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ref_id = int(context.args[0])
         if ref_id != user.id:
             referred_by = ref_id
+
+    await context.bot.send_chat_action(chat_id=user.id, action="typing")
 
     data = await get_or_create_user(user.id, user.first_name or "User", user.username or "", referred_by)
 
@@ -790,18 +824,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
-    if not await is_user_subscribed(user.id, context):
-        await query.answer("⚠️ You haven't joined all channels yet.", show_alert=True)
+    lock = _get_user_lock(user.id)
+    if lock.locked():
+        await query.answer("⏳ Still checking — please wait a moment.")
         return
-    await mark_verified_and_reward_inviter(user.id)
-    await query.answer("✅ Verified!")
-    await query.message.delete()
-    await context.bot.send_message(
-        chat_id=user.id,
-        text=await _build_welcome_text(user.first_name or "friend"),
-        parse_mode="HTML",
-        reply_markup=main_keyboard(user.id),
-    )
+    async with lock:
+        if not await is_user_subscribed(user.id, context):
+            await query.answer("⚠️ You haven't joined all channels yet.", show_alert=True)
+            return
+        await mark_verified_and_reward_inviter(user.id)
+        await query.answer("✅ Verified!")
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=await _build_welcome_text(user.first_name or "friend"),
+            parse_mode="HTML",
+            reply_markup=main_keyboard(user.id),
+        )
 
 
 async def _get_user_or_banned(user_id: int, send) -> dict | None:
@@ -893,7 +932,7 @@ async def _claim_menu_content(user_id: int, user_data: dict | None = None):
         stock_left = len(slot.get("stock", []))
         if claims.get(key):
             continue 
-        label = f"🎁 {name} — {refs}/{required} refers | {stock_left} left"
+        label = f"🎁 {name} — {refs}/{required} ref | {stock_left} left"
         rows.append([InlineKeyboardButton(label, callback_data=f"claim:{key}")])
 
     safe_coupon_name = html.escape(coupon_name)
@@ -942,12 +981,18 @@ async def claim_slot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = query.from_user
     slot_key = query.data.split(":", 1)[1]
 
-    user_data = await get_user(user.id)
-    if user_data and user_data.get("is_banned"):
-        await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+    lock = _get_user_lock(user.id)
+    if lock.locked():
+        await query.answer("⏳ Still processing your last claim — please wait.")
         return
 
-    result = await redeem_slot(user.id, slot_key)
+    async with lock:
+        user_data = await get_user(user.id)
+        if user_data and user_data.get("is_banned"):
+            await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+
+        result = await redeem_slot(user.id, slot_key)
 
     if result == "already_claimed":
         await query.answer("You've already claimed this reward.", show_alert=True)
@@ -991,15 +1036,23 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    total_users, total_refs = await get_users_summary()
-    total_stock = await get_total_stock()
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+    try:
+        total_users, total_refs = await get_users_summary()
+        total_stock = await get_total_stock()
+    except Exception:
+        logger.exception("admin_stats_callback: failed to load stats")
+        await query.message.edit_text(
+            "⚠️ Couldn't load stats right now — please try again in a moment.",
+            reply_markup=keyboard,
+        )
+        return
     msg = (
         "📊 <b>BOT STATS</b>\n\n"
         f"👥 Total Users: <code>{total_users}</code>\n"
         f"🔗 Total Referrals: <code>{total_refs}</code>\n"
         f"📦 Total Stock (all slots): <code>{total_stock}</code>"
     )
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
     await query.message.edit_text(msg, parse_mode="HTML", reply_markup=keyboard)
 
 
@@ -1236,6 +1289,7 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await _get_user_or_banned(user.id, update.message.reply_text)
     if data is None:
         return
+    await context.bot.send_chat_action(chat_id=user.id, action="typing")
     try:
         entries, coupon_name, all_slots = await asyncio.gather(
             get_user_history(user.id, 20),
@@ -1289,18 +1343,52 @@ async def admin_history_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ==================== ADMIN: BROADCAST ====================
-_BROADCAST_CONCURRENCY = 25
+_BROADCAST_CONCURRENCY = 20
+_BROADCAST_RATE_PER_SEC = 25  # stays safely under Telegram's ~30 msg/sec global cap
+
+
+class _RateLimiter:
+    """Token-bucket-style limiter shared across all callers: guarantees no more
+    than `rate` acquisitions per second in total, regardless of how many
+    concurrent tasks are calling it."""
+
+    def __init__(self, rate: float):
+        self._interval = 1.0 / rate
+        self._lock = asyncio.Lock()
+        self._next_slot = 0.0
+
+    async def acquire(self):
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            start = max(now, self._next_slot)
+            self._next_slot = start + self._interval
+            delay = start - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+_broadcast_limiter = _RateLimiter(_BROADCAST_RATE_PER_SEC)
 
 
 async def _send_broadcast_one(context, uid: int, text: str, sem: asyncio.Semaphore) -> bool:
     async with sem:
-        try:
-            await context.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
-            return True
-        except Exception:
-            return False
-        finally:
-            await asyncio.sleep(1.0 / 28)
+        for attempt in range(3):
+            await _broadcast_limiter.acquire()
+            try:
+                await context.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+                return True
+            except RetryAfter as e:
+                # Telegram's own flood-control response — back off exactly as told, then retry.
+                await asyncio.sleep(e.retry_after + 0.5)
+                continue
+            except (Forbidden, BadRequest):
+                # User blocked the bot / chat no longer exists — not retryable.
+                return False
+            except TelegramError:
+                logger.warning("Broadcast send failed for %s (attempt %s)", uid, attempt + 1)
+                await asyncio.sleep(1.0)
+                continue
+        return False
 
 
 async def cancel_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1319,10 +1407,13 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = " ".join(context.args)
     user_ids = await get_all_user_ids()
+    status_msg = await update.message.reply_text(
+        f"📢 Broadcasting to <code>{len(user_ids)}</code> users…", parse_mode="HTML"
+    )
     sem = asyncio.Semaphore(_BROADCAST_CONCURRENCY)
     results = await asyncio.gather(*(_send_broadcast_one(context, uid, text, sem) for uid in user_ids))
     sent = sum(results)
-    await update.message.reply_text(f"📢 Broadcast sent to <code>{sent}/{len(user_ids)}</code> users.", parse_mode="HTML")
+    await status_msg.edit_text(f"📢 Broadcast sent to <code>{sent}/{len(user_ids)}</code> users.", parse_mode="HTML")
 
 
 # ==================== HELP / SUPPORT ====================
@@ -1363,6 +1454,12 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== TEXT MESSAGE ROUTER ====================
+_MENU_BUTTON_TEXTS = {
+    "👤 Profile", "🔗 Invite & Earn", "🎁 Claim Reward", "📜 History",
+    "❓ Help", "📞 Support", "🛠 Admin Panel",
+}
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()
@@ -1373,9 +1470,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["pending_action"] = None
             await update.message.reply_text("❌ Cancelled.")
             return
-        await handle_pending_admin_input(update, context, pending, text)
-        context.user_data["pending_action"] = None
-        return
+        if text in _MENU_BUTTON_TEXTS:
+            # A menu button always cancels whatever prompt was open, instead
+            # of being fed in as the answer to that prompt.
+            context.user_data["pending_action"] = None
+        else:
+            await handle_pending_admin_input(update, context, pending, text)
+            context.user_data["pending_action"] = None
+            return
 
     if text == "👤 Profile":
         await show_profile(update, context)
@@ -1504,6 +1606,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
+    # Admin-only actions must be re-checked here even though the panel that
+    # surfaces these buttons is itself admin-gated — a forwarded message (or
+    # the bot later being added to a group) would otherwise let a non-admin
+    # trigger these callbacks directly.
+    if (data.startswith("admin_") or data.startswith("inv_")) and query.from_user.id not in ADMIN_IDS:
+        await query.answer("🚫 Admins only.", show_alert=True)
+        return
+
     if data == "verify":
         await handle_verify_callback(update, context)
     elif data == "admin_panel":
@@ -1566,12 +1676,33 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
 
+# ==================== ERROR HANDLING ====================
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catches any exception not already handled inside a specific handler.
+    Logs it so failures are visible instead of silently doing nothing, and
+    keeps the bot process alive — PTB already isolates per-update exceptions,
+    this just makes sure we can see them in the logs."""
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+
+
 # ==================== MAIN ====================
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Set the BOT_TOKEN environment variable before running.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        # Process multiple users' updates in parallel instead of one at a time,
+        # so one slow request doesn't stall everyone else.
+        .concurrent_updates(64)
+        # Avoid workers hanging indefinitely on a stalled network call.
+        .connect_timeout(15)
+        .read_timeout(15)
+        .write_timeout(15)
+        .pool_timeout(15)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast))
@@ -1579,6 +1710,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(ChatMemberHandler(on_channel_membership_change, ChatMemberHandler.CHAT_MEMBER))
+    app.add_error_handler(global_error_handler)
 
     print("🤖 Bot started (Firebase edition)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
